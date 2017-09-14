@@ -48,149 +48,170 @@
 # Author: Chris Boulton <chris@chrisboulton.com>
 # License: MIT (http://www.opensource.org/licenses/mit-license.php)
 #
+
+require 'sensu-plugin/check/cli'
 require 'redis'
-require 'optparse'
- 
-STATES = {
-  :ok       => 0,
-  :warning  => 1,
-  :critical => 2,
-  :unknown  => 3,
-}
- 
-options = {
-  :host    => '127.0.0.1',
-  :port    => 26379,
-  :master  => nil,
-  :timeout => 2,
-}
- 
-$results     = []
-$exit_status = :ok
- 
-def add_state(status, msg, should_exit = false)
-  $results.push(msg)
-  $exit_status = status if STATES[status] > STATES[$exit_status]
-  if should_exit
+
+class RedisSentinelMasterHealthCheck < Sensu::Plugin::Check::CLI
+
+
+  option :host,
+    :short => '-h HOST',
+    :long => '--host HOST',
+    :description => 'Redis Sentinel Host to connect to',
+    :required => false,
+    :default => '127.0.0.1'
+
+  option :port,
+    :short => '-p PORT',
+    :long => '--port PORT',
+    :description => 'Redis Port to connect to',
+    :proc => proc { |p| p.to_i },
+    :required => false,
+    :default => 26379
+
+  option :master,
+    :short => '-m MASTER',
+    :long => '--master MASTER',
+    :description => 'Redis Sentinel Master to check',
+    :required => true
+
+  option :timeout,
+    :short => '-t TIMEOUT',
+    :long => '--timeout TIMEOUT',
+    :description => 'Timeout for redis connection',
+    :proc => proc { |p| p.to_i },
+    :required => false,
+    :default => 2
+
+  option :critical,
+    :short => '-c CRITICAL_SLAVES,CRITICAL_SENTINELS',
+    :long => '--critical CRITICAL_SLAVES,CRITICAL_SENTINELS',
+    :description => 'Critical threshold for slaves and sentinel failures',
+    :required => false,
+    :default => "1,1"
+
+  option :warning,
+    :short => '-w WARNING_SLAVES,WARNING_SENTINELS',
+    :long => '--warning WARNING_SLAVES,WARNING_SENTINELS',
+    :description => 'Warning threshold for slaves and sentinel failures',
+    :required => false,
+    :default => "1,1"
+
+  @@STATES = {
+    :ok       => 0,
+    :warning  => 1,
+    :critical => 2,
+    :unknown  => 3
+  }
+
+  @@results = []
+  @@exit_status = :ok
+
+  def add_state(status, msg, should_exit = false)
+    @@results.push(msg)
+    @@exit_status = status if @@STATES[status] > @@STATES[@@exit_status]
+    if should_exit
+      do_exit
+    end
+  end
+
+  def add_info(msg)
+    @@results.push(msg)
+  end
+
+  def do_exit
+    send(@@exit_status,"#{@@exit_status.upcase} - #{@@results.join('. ')}")
+  end
+
+  def run
+
+    config[:min_slaves_warn], config[:min_sentinels_warn] = config[:warning].split(',').map{|i| i == '' ? nil : i.to_i }
+    config[:min_slaves_crit], config[:min_sentinels_crit] = config[:critical].split(',').map{|i| i == '' ? nil : i.to_i }
+
+    begin
+      redis = Redis.new(:host => config[:host], :port => config[:port], :timeout => config[:timeout])
+    rescue Redis::BaseConnectionError => e
+      add_state(:critical, e, true)
+    end
+
+    begin
+      master_info = Hash[*redis.sentinel('master', config[:master])]
+      sentinels   = redis.sentinel('sentinels', config[:master])
+      slaves      = redis.sentinel('slaves', config[:master])
+
+      quorum        = master_info['quorum'].to_i
+      num_slaves    = master_info['num-slaves'].to_i
+      num_sentinels = master_info['num-other-sentinels'].to_i + 1
+      flags         = master_info['flags'].split(',')
+
+      if flags.include?('o_down')
+        add_state(:critical, 'OBJECTIVELY DOWN')
+      elsif flags.include?('s_down')
+        add_state(:critical, 'SUBJECTIVELY DOWN')
+      end
+
+      num_healthy_slaves = slaves.count do |slave_info|
+        slave_info = Hash[*slave_info]
+        slave_status = slave_info['flags'].split(',')
+        !slave_status.include?('o_down') and
+          !slave_status.include?('s_down') and
+          !slave_status.include?('disconnected') and
+          slave_info['slave-priority'].to_i > 0 and
+          slave_info['last-ok-ping-reply'].to_i < 5000
+      end
+
+      num_healthy_sentinels = sentinels.count do |sentinel_info|
+        sentinel_info = Hash[*sentinel_info]
+        sentinel_status = sentinel_info['flags'].split(',')
+        !sentinel_status.include?('o_down') and
+          !sentinel_status.include?('s_down') and
+          !sentinel_status.include?('disconnected')
+      end
+      # assume the local sentinel is healthy
+      num_healthy_sentinels += 1
+
+      slave_status    = "#{num_healthy_slaves}/#{num_slaves} slaves healthy"
+      sentinel_status = "#{num_healthy_sentinels}/#{num_sentinels} sentinels healthy"
+
+      if config[:min_slaves_crit] != nil and num_slaves <= config[:min_slaves_crit]
+        add_state(:critical, "#{num_slaves} known slaves, expected at least #{config[:min_slaves_crit] + 1}")
+      elsif config[:min_slaves_warn] != nil and num_slaves <= config[:min_slaves_warn]
+        add_state(:warning, "#{num_slaves} known slaves, expected at least #{config[:min_slaves_warn] + 1}")
+      else
+        add_info(slave_status)
+      end
+
+      if config[:min_slaves_crit] != nil and num_healthy_slaves <= config[:min_slaves_crit]
+        add_state(:critical, "Expected at least #{config[:min_slaves_crit] + 1} healthy slaves")
+      elsif config[:min_slaves_warn] != nil and num_healthy_slaves <= config[:min_slaves_warn]
+        add_state(:warning, "Expected at least #{config[:min_slaves_warn] + 1} healthy slaves")
+      end
+
+      if config[:min_sentinels_crit] != nil and num_sentinels <= config[:min_sentinels_crit]
+        add_state(:critical, "#{num_sentinels} known sentinels, expected at least #{config[:min_sentinels_crit] + 1}")
+      elsif config[:min_sentinels_warn] != nil and num_sentinels <= config[:min_sentinels_warn]
+        add_state(:warning, "#{num_sentinels} known sentinels, expected at least #{config[:min_sentinels_warn] + 1}")
+      else
+        add_info(sentinel_status)
+      end
+
+      if config[:min_sentinels_crit] != nil and num_healthy_sentinels <= config[:min_sentinels_crit]
+        add_state(:critical, "Expected at least #{config[:min_sentinels_crit] + 1} healthy sentinels")
+      elsif config[:min_sentinels_warn] != nil and num_healthy_sentinels <= config[:min_sentinels_warn]
+        add_state(:warning, "Expected at least #{config[:min_sentinels_warn] + 1} healthy sentinels")
+      end
+
+      if quorum == 0
+        add_state(:critical, 'No quorum set')
+      elsif num_sentinels < quorum
+        add_state(:critical, 'Quorum not met')
+      elsif num_healthy_sentinels < quorum
+        add_state(:critical, "Not enough healthy sentinels for quorum (#{quorum})")
+      end
+    rescue Redis::CommandError => e
+      add_state(:critical, e)
+    end
     do_exit
   end
 end
- 
-def add_info(msg)
-  $results.push(msg)
-end
- 
-def do_exit
-  puts "#{$exit_status.upcase} - #{$results.join('. ')}"
-  exit STATES[$exit_status]
-end
- 
-optparse = OptionParser.new do |opts|
-  opts.on('-H', '--host HOST', 'Hostname') do |h|
-    options[:host] = h
-  end
-  opts.on('-p', '--port PORT', 'Port') do |p|
-    options[:port] = p.to_i
-  end
-  opts.on('-m', '--master MASTER', 'Perform Sentinel health checks against this master') do |m|
-    options[:master] = m
-  end
-  opts.on('-w', '--warning THRESHOLDS', 'Comma separated string of warning thresholds for min slaves and min masters') do |t|
-    options[:min_slaves_warn], options[:min_sentinels_warn] = t.split(',').map{|i| i == '' ? nil : i.to_i }
-  end
-  opts.on('-c', '--critical THRESHOLDS', 'Comma separated string of critical thresholds for min slaves and min masters') do |t|
-    options[:min_slaves_crit], options[:min_sentinels_crit] = t.split(',').map{|i| i == '' ? nil : i.to_i }
-  end
-end
-optparse.parse!
- 
-unless options[:master]
-  puts optparse
-  exit(1)
-end
- 
-begin
-  redis = Redis.new(:host => options[:host], :port => options[:port], :timeout => options[:timeout])
-rescue Redis::BaseConnectionError => e
-  add_state(:critical, e, true)
-end
- 
-begin
-  master_info = Hash[*redis.sentinel('master', options[:master])]
-  sentinels   = redis.sentinel('sentinels', options[:master])
-  slaves      = redis.sentinel('slaves', options[:master])
- 
-  quorum        = master_info['quorum'].to_i
-  num_slaves    = master_info['num-slaves'].to_i
-  num_sentinels = master_info['num-other-sentinels'].to_i + 1
-  flags         = master_info['flags'].split(',')
- 
-  if flags.include?('o_down')
-    add_state(:critical, 'OBJECTIVELY DOWN')
-  elsif flags.include?('s_down')
-    add_state(:critical, 'SUBJECTIVELY DOWN')
-  end
- 
-  num_healthy_slaves = slaves.count do |slave_info|
-    slave_info = Hash[*slave_info]
-    slave_status = slave_info['flags'].split(',')
-    !slave_status.include?('o_down') and
-      !slave_status.include?('s_down') and
-      !slave_status.include?('disconnected') and
-      slave_info['slave-priority'].to_i > 0 and
-      slave_info['last-ok-ping-reply'].to_i < 5000
-  end
- 
-  num_healthy_sentinels = sentinels.count do |sentinel_info|
-    sentinel_info = Hash[*sentinel_info]
-    sentinel_status = sentinel_info['flags'].split(',')
-    !sentinel_status.include?('o_down') and
-      !sentinel_status.include?('s_down') and
-      !sentinel_status.include?('disconnected')
-  end
-  # assume the local sentinel is healthy
-  num_healthy_sentinels += 1
- 
-  slave_status    = "#{num_healthy_slaves}/#{num_slaves} slaves healthy"
-  sentinel_status = "#{num_healthy_sentinels}/#{num_sentinels} sentinels healthy"
- 
-  if options[:min_slaves_crit] != nil and num_slaves <= options[:min_slaves_crit]
-    add_state(:critical, "#{num_slaves} known slaves, expected at least #{options[:min_slaves_crit] + 1}")
-  elsif options[:min_slaves_warn] != nil and num_slaves <= options[:min_slaves_warn]
-    add_state(:warning, "#{num_slaves} known slaves, expected at least #{options[:min_slaves_warn] + 1}")
-  else
-    add_info(slave_status)
-  end
- 
-  if options[:min_slaves_crit] != nil and num_healthy_slaves <= options[:min_slaves_crit]
-    add_state(:critical, "Expected at least #{options[:min_slaves_crit] + 1} healthy slaves")
-  elsif options[:min_slaves_warn] != nil and num_healthy_slaves <= options[:min_slaves_warn]
-    add_state(:warning, "Expected at least #{options[:min_slaves_warn] + 1} healthy slaves")
-  end
- 
-  if options[:min_sentinels_crit] != nil and num_sentinels <= options[:min_sentinels_crit]
-    add_state(:critical, "#{num_sentinels} known sentinels, expected at least #{min_sentinels_crit + 1}")
-  elsif options[:min_sentinels_warn] != nil and num_sentinels <= options[:min_sentinels_warn]
-    add_state(:warning, "#{num_sentinels} known sentinels, expected at least #{min_sentinels_warn + 1}")
-  else
-    add_info(sentinel_status)
-  end
- 
-  if options[:min_sentinels_crit] != nil and num_healthy_sentinels <= options[:min_sentinels_crit]
-    add_state(:critical, "Expected at least #{options[:min_sentinels_crit] + 1} healthy sentinels")
-  elsif options[:min_sentinels_warn] != nil and num_healthy_sentinels <= options[:min_sentinels_warn]
-    add_state(:warning, "Expected at least #{options[:min_sentinels_warn] + 1} healthy sentinels")
-  end
- 
-  if quorum == 0
-    add_state(:critical, 'No quorum set')
-  elsif num_sentinels < quorum
-    add_state(:critical, 'Quorum not met')
-  elsif num_healthy_sentinels < quorum
-    add_state(:critical, "Not enough healthy sentinels for quorum (#{quorum})")
-  end
-rescue Redis::CommandError => e
-  add_state(:critical, e)
-end
- 
-do_exit
